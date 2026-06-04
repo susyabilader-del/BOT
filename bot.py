@@ -1,7 +1,7 @@
 import asyncio
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     filters, ContextTypes
 )
 from config import Config
@@ -29,19 +29,20 @@ class VerifierBot:
 
         await update.message.reply_text(
             "🔍 **Ödeme Doğrulama Botu**\n\n"
-            "**Temel Komutlar:**\n"
-            "/scan - Grupları tara\n"
-            "/verify - Doğrulama çalıştır\n"
-            "/report - Rapor göster\n\n"
-            "**Sorgulama:**\n"
-            "/musteri <isim/ID> - Müşteri işlem detayı\n"
-            "/tutarsizlik - Tutarsızlık listesi\n"
+            "**🚨 Tespit:**\n"
+            "/verify - Tam doğrulama (kritik çelişkiler)\n"
+            "/tutarsiz - Sadece çelişki/tutarsızlıklar\n\n"
+            "**🔎 Sorgulama:**\n"
+            "/cekim - Çekim işlemleri (iptal/bekleyen)\n"
+            "/yatirim - Yatırım işlemleri\n"
+            "/musteri <isim/ID> - Müşteri detay\n"
+            "/tarih <GG.AA> - Tarihe göre sorgula\n"
             "/search <metin> - Gruplarda ara\n\n"
-            "**Yönetim:**\n"
-            "/rules - Aktif kuralları listele\n"
-            "/addrule - Yeni kural ekle\n"
-            "/status - Bot durumu\n"
-            "/help - Yardım",
+            "**📊 Genel:**\n"
+            "/scan - Grupları tara\n"
+            "/report - Rapor göster\n"
+            "/api geciken - API geciken işlemler\n"
+            "/status - Bot durumu",
             parse_mode="Markdown"
         )
 
@@ -73,30 +74,40 @@ class VerifierBot:
             total_src = result.get("total_source", 0)
             total_ver = result.get("total_verify", 0)
 
+            # SADECE KRİTİK çelişkileri filtrele
+            critical_types = {"IPTAL_AMA_ODENMIS", "ONAY_AMA_RED", "ODENMIS_AMA_RED",
+                            "TUTAR_UYUSMAZLIGI", "API_RED_GRUP_ONAY", "API_ONAY_GRUP_IPTAL"}
+            critical_issues = [i for i in issues if i.get("type") in critical_types]
+            critical_rules = [r for r in rule_results if r.get("status") == "inconsistent"]
+
+            # Onaylananlar
+            confirmed = [r for r in rule_results if r.get("status") == "confirmed"]
+
             text = f"✅ **Doğrulama Tamamlandı**\n"
-            text += f"📤 Kaynak: {total_src} mesaj | 📥 Doğrulama: {total_ver} mesaj\n\n"
+            text += f"📤 Bayi: {total_src} | 📥 Teyid: {total_ver} mesaj\n\n"
 
-            # Kritik tutarsızlıklar
-            if issues:
-                text += f"🔴 **{len(issues)} TUTARSIZLIK TESPİT EDİLDİ:**\n"
-                for issue in issues[:5]:
-                    text += f"  • {issue['message'][:100]}\n"
-                if len(issues) > 5:
-                    text += f"  ... ve {len(issues) - 5} daha\n"
-                text += "\n"
+            # Kritik çelişkiler (önemli olanlar)
+            all_critical = critical_issues + critical_rules
+            if all_critical:
+                text += f"� **{len(all_critical)} KRİTİK ÇELİŞKİ:**\n"
+                for item in all_critical[:8]:
+                    if "message" in item:
+                        text += f"  🔴 {item['message'][:100]}\n"
+                    else:
+                        text += f"  🔴 [{item.get('rule_name','')}] {item.get('details','')[:100]}\n"
+                if len(all_critical) > 8:
+                    text += f"\n  → /tutarsiz ile tümünü gör\n"
+            else:
+                text += "✅ Kritik çelişki yok!\n"
 
-            # Kural eşleşmeleri
-            if rule_results:
-                text += f"📋 **{len(rule_results)} Kural Eşleşmesi:**\n"
-                status_icons = {"confirmed": "✅", "partial": "⚠️", "inconsistent": "🔴", "pending": "⏳"}
-                for r in rule_results[:5]:
-                    icon = status_icons.get(r['status'], '❓')
-                    text += f"  {icon} [{r['rule_name']}] {r['details'][:80]}\n"
-                if len(rule_results) > 5:
-                    text += f"  ... ve {len(rule_results) - 5} daha\n"
+            # Özet istatistik
+            text += f"\n📊 **Özet:**\n"
+            text += f"  ✅ Onaylı eşleşme: {len(confirmed)}\n"
+            text += f"  🔴 Kritik çelişki: {len(all_critical)}\n"
+            text += f"  📋 Toplam kural eşleşmesi: {len(rule_results)}\n"
 
-            if not issues and not rule_results:
-                text += "ℹ️ Tutarsızlık veya eşleşme bulunamadı."
+            # Navigasyon
+            text += "\nℹ️ /cekim | /yatirim | /tutarsiz | /musteri <isim>"
 
             await msg.edit_text(text, parse_mode="Markdown")
         except Exception as e:
@@ -328,31 +339,229 @@ class VerifierBot:
             await msg.edit_text(f"❌ Sorgulama hatası: {e}")
 
     async def cmd_tutarsizlik(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Tüm tutarsızlıkları listele."""
+        """Sadece kritik tutarsızlıkları listele."""
         if not self._is_admin(update.effective_user.id):
             return
 
         try:
             issues = self.verifier.tracker.get_all_inconsistencies()
-            if not issues:
-                await update.message.reply_text("✅ Aktif tutarsızlık bulunamadı.")
+            # Sadece kritik olanları göster (DOGRULAMA_YOK ve UZUN_BEKLEME hariç)
+            critical_types = {"IPTAL_AMA_ODENMIS", "ONAY_AMA_RED", "ODENMIS_AMA_RED", "TUTAR_UYUSMAZLIGI"}
+            filtered = [i for i in issues if i.get("type") in critical_types]
+
+            if not filtered:
+                # Warning seviyesini de göster
+                filtered = [i for i in issues if i.get("severity") in ("critical", "warning")
+                           and i.get("type") != "DOGRULAMA_YOK"]
+
+            if not filtered:
+                await update.message.reply_text("✅ Kritik tutarsızlık bulunamadı.")
                 return
 
-            text = f"🔴 **{len(issues)} Tutarsızlık Tespit Edildi:**\n\n"
-            severity_order = {"critical": 0, "warning": 1, "info": 2}
-            sorted_issues = sorted(issues, key=lambda x: severity_order.get(x["severity"], 3))
-
-            for i, issue in enumerate(sorted_issues[:10], 1):
-                icon = {"critical": "�", "warning": "⚠️", "info": "ℹ️"}.get(issue["severity"], "❓")
+            text = f"� **{len(filtered)} Tutarsızlık:**\n\n"
+            for i, issue in enumerate(filtered[:15], 1):
+                icon = {"critical": "🔴", "warning": "⚠️", "info": "ℹ️"}.get(issue["severity"], "❓")
                 text += f"{i}. {icon} **{issue['type']}**\n"
                 text += f"   {issue['message'][:120]}\n\n"
 
-            if len(issues) > 10:
-                text += f"... ve {len(issues) - 10} tutarsızlık daha"
+            if len(filtered) > 15:
+                text += f"... ve {len(filtered) - 15} daha"
 
             await update.message.reply_text(text, parse_mode="Markdown")
         except Exception as e:
             await update.message.reply_text(f"❌ Hata: {e}")
+
+    async def cmd_cekim(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Çekim işlemlerini listele - iptal, bekleyen, onaylı."""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        from parser import MessageParser, IslemTipi
+        from database import get_messages_by_group
+        from datetime import datetime, timedelta
+
+        msg = await update.message.reply_text("🔍 Çekim işlemleri taranıyor...")
+
+        try:
+            parser = MessageParser()
+            since = (datetime.now() - timedelta(days=7)).isoformat()
+            messages = await get_messages_by_group("source", since_date=since, limit=3000)
+            verify_msgs = await get_messages_by_group("verify", since_date=since, limit=3000)
+
+            cekimler = []
+            for m in messages + verify_msgs:
+                p = parser.parse(m["text"])
+                if p.tutar_yonu == "cekim" or p.islem_tipi in (IslemTipi.CEKIM_TALEBI, IslemTipi.CEKIM_IPTAL):
+                    cekimler.append({
+                        "isim": p.musteri_adi or "?",
+                        "id": p.musteri_id or "",
+                        "tutar": p.tutar,
+                        "durum": p.durum or p.islem_tipi.value,
+                        "tarih": m["date"][:16],
+                        "grup": "Bayi" if m["group_type"] == "source" else "Teyid"
+                    })
+
+            if not cekimler:
+                await msg.edit_text("ℹ️ Son 7 günde çekim işlemi bulunamadı.")
+                return
+
+            # İptal olanları önce göster
+            iptal = [c for c in cekimler if "iptal" in c["durum"]]
+            bekleyen = [c for c in cekimler if c["durum"] in ("bekleyen", "beklemede", "cekim_talebi")]
+            diger = [c for c in cekimler if c not in iptal and c not in bekleyen]
+
+            text = f"💸 **Çekim İşlemleri** (son 7 gün)\n\n"
+
+            if iptal:
+                text += f"🚫 **İPTAL ({len(iptal)}):**\n"
+                for c in iptal[:5]:
+                    text += f"  • {c['isim']} | ₺{c['tutar'] or '?'} | {c['tarih']}\n"
+                text += "\n"
+
+            if bekleyen:
+                text += f"⏳ **BEKLEYEN ({len(bekleyen)}):**\n"
+                for c in bekleyen[:5]:
+                    text += f"  • {c['isim']} | ₺{c['tutar'] or '?'} | {c['tarih']}\n"
+                text += "\n"
+
+            text += f"📊 Toplam: {len(cekimler)} çekim | {len(iptal)} iptal | {len(bekleyen)} bekleyen"
+
+            await msg.edit_text(text, parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ Hata: {e}")
+
+    async def cmd_yatirim(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Yatırım işlemlerini listele."""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        from parser import MessageParser, IslemTipi
+        from database import get_messages_by_group
+        from datetime import datetime, timedelta
+
+        msg = await update.message.reply_text("🔍 Yatırım işlemleri taranıyor...")
+
+        try:
+            parser = MessageParser()
+            since = (datetime.now() - timedelta(days=7)).isoformat()
+            messages = await get_messages_by_group("verify", since_date=since, limit=3000)
+
+            yatirimlar = []
+            for m in messages:
+                p = parser.parse(m["text"])
+                if p.tutar_yonu == "yatirim" or (p.tutar and p.is_structured and p.tutar_yonu != "cekim"):
+                    yatirimlar.append({
+                        "isim": p.musteri_adi or "?",
+                        "id": p.musteri_id or "",
+                        "tutar": p.tutar,
+                        "durum": p.durum or p.islem_tipi.value,
+                        "tarih": m["date"][:16],
+                        "iban": p.iban or ""
+                    })
+
+            if not yatirimlar:
+                await msg.edit_text("ℹ️ Son 7 günde yatırım işlemi bulunamadı.")
+                return
+
+            bekleyen = [y for y in yatirimlar if y["durum"] in ("bekleyen", "beklemede")]
+            red = [y for y in yatirimlar if y["durum"] in ("reddedildi", "red")]
+
+            text = f"💰 **Yatırım İşlemleri** (son 7 gün)\n\n"
+
+            if bekleyen:
+                text += f"⏳ **BEKLEYEN ({len(bekleyen)}):**\n"
+                for y in bekleyen[:5]:
+                    text += f"  • {y['isim']} | ₺{y['tutar'] or '?'} | {y['tarih']}\n"
+                text += "\n"
+
+            if red:
+                text += f"❌ **REDDEDİLEN ({len(red)}):**\n"
+                for y in red[:5]:
+                    text += f"  • {y['isim']} | ₺{y['tutar'] or '?'} | {y['tarih']}\n"
+                text += "\n"
+
+            text += f"📊 Toplam: {len(yatirimlar)} yatırım | {len(bekleyen)} bekleyen | {len(red)} red"
+
+            await msg.edit_text(text, parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ Hata: {e}")
+
+    async def cmd_tarih(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Belirli bir tarihteki işlemleri listele."""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        if not context.args:
+            await update.message.reply_text(
+                "Kullanım: `/tarih <GG.AA>` veya `/tarih <GG.AA.YYYY>`\n"
+                "Örnek: `/tarih 02.06` veya `/tarih 02.06.2026`",
+                parse_mode="Markdown"
+            )
+            return
+
+        from parser import MessageParser
+        from database import get_messages_by_group
+        import re
+
+        date_str = context.args[0]
+        # GG.AA formatı → 2026-AA-GG
+        match = re.match(r'(\d{2})\.(\d{2})(?:\.(\d{4}))?', date_str)
+        if not match:
+            await update.message.reply_text("❌ Geçersiz tarih formatı. Örnek: `02.06`", parse_mode="Markdown")
+            return
+
+        day, month, year = match.group(1), match.group(2), match.group(3) or "2026"
+        date_prefix = f"{year}-{month}-{day}"
+
+        msg = await update.message.reply_text(f"🔍 {date_str} tarihli işlemler aranıyor...")
+
+        try:
+            parser = MessageParser()
+            all_msgs = await get_messages_by_group("source", limit=5000)
+            all_msgs += await get_messages_by_group("verify", limit=5000)
+
+            # Tarihe göre filtrele
+            day_msgs = [m for m in all_msgs if m["date"].startswith(date_prefix)]
+
+            if not day_msgs:
+                await msg.edit_text(f"ℹ️ {date_str} tarihinde mesaj bulunamadı.")
+                return
+
+            # Parse et ve anlamlı olanları göster
+            parsed_items = []
+            for m in day_msgs:
+                p = parser.parse(m["text"])
+                if p.musteri_adi or p.musteri_id or p.tutar or p.islem_hash:
+                    parsed_items.append((m, p))
+
+            text = f"📅 **{date_str} Tarihli İşlemler**\n"
+            text += f"Toplam mesaj: {len(day_msgs)} | Anlamlı: {len(parsed_items)}\n\n"
+
+            # Yapılandırılmış blokları göster
+            structured = [(m, p) for m, p in parsed_items if p.is_structured]
+            if structured:
+                text += f"📋 **Yapılandırılmış İşlemler ({len(structured)}):**\n"
+                for m, p in structured[:10]:
+                    icon = "💸" if p.tutar_yonu == "cekim" else "💰"
+                    status = p.durum or p.islem_tipi.value
+                    text += f"  {icon} {p.musteri_adi or '?'} | ₺{p.tutar or '?'} | {status}\n"
+                text += "\n"
+
+            # İptal/red işlemleri
+            issues = [(m, p) for m, p in parsed_items
+                     if p.islem_tipi.value in ("cekim_iptal", "iptal", "red")]
+            if issues:
+                text += f"🚫 **İptal/Red ({len(issues)}):**\n"
+                for m, p in issues[:5]:
+                    text += f"  • {p.musteri_adi or '?'} | {p.islem_tipi.value}\n"
+
+            if not structured and not issues:
+                text += "ℹ️ Yapılandırılmış işlem veya iptal/red bulunamadı.\n"
+                text += "Genel mesajlar mevcut — /search ile arayabilirsiniz."
+
+            await msg.edit_text(text, parse_mode="Markdown")
+        except Exception as e:
+            await msg.edit_text(f"❌ Hata: {e}")
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update.effective_user.id):
@@ -394,6 +603,10 @@ class VerifierBot:
         self.app.add_handler(CommandHandler("api", self.cmd_api))
         self.app.add_handler(CommandHandler("musteri", self.cmd_musteri))
         self.app.add_handler(CommandHandler("tutarsizlik", self.cmd_tutarsizlik))
+        self.app.add_handler(CommandHandler("tutarsiz", self.cmd_tutarsizlik))
+        self.app.add_handler(CommandHandler("cekim", self.cmd_cekim))
+        self.app.add_handler(CommandHandler("yatirim", self.cmd_yatirim))
+        self.app.add_handler(CommandHandler("tarih", self.cmd_tarih))
         self.app.add_handler(CommandHandler("status", self.cmd_status))
         self.app.add_handler(CommandHandler("help", self.cmd_help))
 
