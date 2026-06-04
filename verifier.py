@@ -46,9 +46,9 @@ class VerificationEngine:
         2. Müşteri ID/isim bazlı işlemleri eşleştir
         3. Tutarsızlıkları tespit et
         """
-        since = (datetime.now() - timedelta(hours=24)).isoformat()
-        source_messages = await get_messages_by_group("source", since_date=since, limit=500)
-        verify_messages = await get_messages_by_group("verify", since_date=since, limit=500)
+        since = (datetime.now() - timedelta(days=7)).isoformat()
+        source_messages = await get_messages_by_group("source", since_date=since, limit=3000)
+        verify_messages = await get_messages_by_group("verify", since_date=since, limit=3000)
 
         if not source_messages and not verify_messages:
             logger.debug("İşlenecek mesaj yok")

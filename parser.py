@@ -32,41 +32,57 @@ class ParsedMessage:
     musteri_username: Optional[str] = None
     tutar: Optional[float] = None
     tutar_str: Optional[str] = None
+    tutar_yonu: str = ""  # "cekim" veya "yatirim"
     para_birimi: str = "TL"
     platform: Optional[str] = None
     islem_hash: Optional[str] = None
     durum: Optional[str] = None
     iban: Optional[str] = None
+    talep_tarihi: Optional[str] = None
     reply_to: Optional[str] = None
     keywords: List[str] = field(default_factory=list)
     confidence: float = 0.0
+    is_structured: bool = False  # Yapılandırılmış blok mu?
 
 
 class MessageParser:
     """Telegram mesajlarını parse edip yapılandırılmış veri çıkarır."""
 
     # Müşteri ID pattern: uzun sayısal ID
-    ID_PATTERN = re.compile(r'ID:\s*(\d{10,})', re.IGNORECASE)
+    ID_PATTERN = re.compile(r'ID:\s*(\d{7,})', re.IGNORECASE)
 
     # Username pattern
     USERNAME_PATTERN = re.compile(r'@(\w+)')
 
-    # Tutar patternleri
+    # Tutar patternleri (sıralama önemli - daha spesifik önce)
     TUTAR_PATTERNS = [
+        re.compile(r'-₺\s*([\d.,]+)'),                         # -₺22.000,00 (çekim)
+        re.compile(r'\+₺\s*([\d.,]+)'),                        # +₺22.000,00 (yatırım)
         re.compile(r'₺\s*([\d.,]+)'),                          # ₺22.000,00
         re.compile(r'([\d.,]+)\s*₺'),                          # 22.000,00₺
         re.compile(r'([\d.,]+)\s*(TL|tl|Tl)', re.IGNORECASE),  # 22000 TL
         re.compile(r'([\d.,]+)\s*(USD|EUR|GBP)', re.IGNORECASE),
     ]
 
-    # İşlem hash pattern (kısa hex string)
-    HASH_PATTERN = re.compile(r'\b([a-f0-9]{6,10}[a-f0-9]*)\b', re.IGNORECASE)
+    # İşlem hash pattern (SHA256 - 64 hex karakter)
+    HASH_PATTERN = re.compile(r'^([a-f0-9]{64})$', re.IGNORECASE | re.MULTILINE)
+    SHORT_HASH_PATTERN = re.compile(r'\b([a-f0-9]{8,16})\b', re.IGNORECASE)
 
     # IBAN pattern
     IBAN_PATTERN = re.compile(r'TR\d{2}\s*\d{4}\s*\d{4}\s*\d{4}\s*\d{4}\s*\d{4}\s*\d{2}')
 
+    # Talep tarihi pattern
+    TALEP_PATTERN = re.compile(r'Talep:\s*(\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2})')
+
+    # KT grubu formatı: "USERNAME  PLAYERID  AD  SOYAD"
+    KT_FORMAT_PATTERN = re.compile(
+        r'^([A-Za-z0-9_]+)\s+(\d{5,})\s+([A-ZÇĞIİÖŞÜa-zçğıöşü]+)\s+([A-ZÇĞIİÖŞÜa-zçğıöşü]+)',
+        re.MULTILINE
+    )
+
     # Platform patternleri
-    PLATFORMS = ["ALLHAVALE", "PAPARA", "PAYFIX", "MEFETE", "HAVALE", "EFT", "FAST"]
+    PLATFORMS = ["ALLHAVALE", "PAPARA", "PAYFIX", "MEFETE", "HAVALE", "EFT", "FAST",
+                 "ANINDA HAVALE", "ANINDA BANKA"]
 
     # İşlem tipi keyword'leri
     ISLEM_KEYWORDS = {
@@ -80,10 +96,12 @@ class MessageParser:
         ],
         IslemTipi.ODEME: [
             r'ödeme\s*sağlan', r'ödeme\s*(?:yapıl|tamam|ok)',
-            r'ödendi', r'ödeme\s*onay'
+            r'ödendi', r'ödeme\s*onay', r'ödeme\s*girelim',
+            r'ödeme\s*kt'
         ],
         IslemTipi.ONAY: [
-            r'onaylı', r'onaylandı', r'onay\s*ver', r'bende\s*onaylı'
+            r'^onay$', r'^onay\s*✅', r'onaylı', r'onaylandı', r'onay\s*ver',
+            r'bende\s*onaylı', r'onaydır'
         ],
         IslemTipi.RED: [
             r'red(?:det|d)', r'reddedil', r'red\s*ver', r'red\s*geldi'
@@ -95,7 +113,8 @@ class MessageParser:
             r'uygundur', r'uygun(?:dur)?$'
         ],
         IslemTipi.KT: [
-            r'^kt$', r'\bkt\b'
+            r'^kt$', r'^kt\s', r'ödeme\s*kt', r'kt\s*lütfen',
+            r'dekont.*kt'
         ],
         IslemTipi.IPTAL: [
             r'^iptal$', r'iptal\s*edildi'
@@ -119,7 +138,17 @@ class MessageParser:
         """Mesaj metnini parse eder ve yapılandırılmış veri döner."""
         msg = ParsedMessage(raw_text=text)
 
-        # Müşteri bilgileri
+        # Önce yapılandırılmış blok mu kontrol et
+        structured = self._parse_structured_block(text)
+        if structured:
+            return structured
+
+        # KT grubu formatı kontrol et
+        kt_msg = self._parse_kt_format(text)
+        if kt_msg:
+            return kt_msg
+
+        # Genel parsing
         msg.musteri_id = self._extract_id(text)
         msg.musteri_username = self._extract_username(text)
         msg.musteri_adi = self._extract_name(text)
@@ -127,12 +156,13 @@ class MessageParser:
         # Finansal bilgiler
         tutar_info = self._extract_tutar(text)
         if tutar_info:
-            msg.tutar, msg.tutar_str, msg.para_birimi = tutar_info
+            msg.tutar, msg.tutar_str, msg.para_birimi, msg.tutar_yonu = tutar_info
 
         # İşlem bilgileri
         msg.islem_hash = self._extract_hash(text)
         msg.iban = self._extract_iban(text)
         msg.platform = self._extract_platform(text)
+        msg.talep_tarihi = self._extract_talep_tarihi(text)
 
         # İşlem tipi
         msg.islem_tipi, msg.confidence = self._detect_islem_tipi(text)
@@ -148,6 +178,132 @@ class MessageParser:
 
         return msg
 
+    def _parse_structured_block(self, text: str) -> Optional[ParsedMessage]:
+        """
+        Yapılandırılmış işlem bloğunu parse eder.
+        Format:
+            mediha tekgöz
+            @tekmediha99
+            ID: 2026035075909
+            -
+            mediha tekgöz
+            TR890015700000000123516764
+            -₺22.000,00
+            Beklemede
+            Talep: 02.06.2026 06:23
+        """
+        lines = [l.strip() for l in text.strip().split('\n') if l.strip()]
+
+        # Yapılandırılmış blok tespiti: ID: ve ₺ ve en az 5 satır
+        has_id = any(re.match(r'ID:\s*\d+', l, re.IGNORECASE) for l in lines)
+        has_tutar = any('₺' in l for l in lines)
+
+        if not has_id or not has_tutar or len(lines) < 4:
+            return None
+
+        msg = ParsedMessage(raw_text=text, is_structured=True)
+
+        for i, line in enumerate(lines):
+            # ID satırı
+            id_match = re.match(r'ID:\s*(\d+)', line, re.IGNORECASE)
+            if id_match:
+                msg.musteri_id = id_match.group(1)
+                # İlk satır isim olabilir
+                if i > 0 and not lines[i-1].startswith('@') and not lines[i-1].startswith('-'):
+                    # Bir önceki @username ise, ondan önceki isimdir
+                    if i >= 2 and lines[i-1].startswith('@'):
+                        msg.musteri_adi = lines[i-2]
+                    elif not lines[i-1].startswith('@'):
+                        msg.musteri_adi = lines[0]  # İlk satır genelde isim
+                continue
+
+            # Username satırı
+            if line.startswith('@'):
+                msg.musteri_username = line[1:]  # @ işaretini kaldır
+                continue
+
+            # IBAN satırı
+            iban_match = self.IBAN_PATTERN.match(line)
+            if iban_match:
+                msg.iban = line.replace(' ', '')
+                continue
+
+            # Tutar satırı
+            if '₺' in line:
+                is_negative = line.strip().startswith('-')
+                tutar_info = self._extract_tutar(line)
+                if tutar_info:
+                    msg.tutar, msg.tutar_str, msg.para_birimi, _ = tutar_info
+                    msg.tutar_yonu = "cekim" if is_negative else "yatirim"
+                continue
+
+            # Talep tarihi
+            talep_match = self.TALEP_PATTERN.match(line)
+            if talep_match:
+                msg.talep_tarihi = talep_match.group(1)
+                continue
+
+            # Durum satırı
+            durum = self._detect_durum(line)
+            if durum and line.strip() != '-':
+                msg.durum = durum
+                continue
+
+        # İlk satırı isim olarak al (eğer henüz bulunamadıysa)
+        if not msg.musteri_adi and lines:
+            first = lines[0]
+            if not first.startswith('@') and not first.startswith('ID:') and '₺' not in first:
+                msg.musteri_adi = first
+
+        # İşlem tipini belirle
+        msg.islem_tipi, msg.confidence = self._detect_islem_tipi(text)
+
+        # Yapılandırılmış blokta çekim/yatırım tespiti
+        if msg.islem_tipi == IslemTipi.BILINMIYOR:
+            if msg.tutar_yonu == "cekim":
+                msg.islem_tipi = IslemTipi.CEKIM_TALEBI
+                msg.confidence = 0.8
+            elif msg.durum == "bekleyen":
+                msg.islem_tipi = IslemTipi.BEKLEYEN
+                msg.confidence = 0.8
+
+        msg.keywords = self._extract_keywords(text)
+        msg.platform = self._extract_platform(text)
+
+        return msg
+
+    def _parse_kt_format(self, text: str) -> Optional[ParsedMessage]:
+        """
+        KT grubu formatını parse eder.
+        Format: FATOM5858  737266144  Sebahattin  Kılıç
+                Anında Havale dekont iletildi kt lütfen
+        """
+        match = self.KT_FORMAT_PATTERN.search(text)
+        if not match:
+            return None
+
+        msg = ParsedMessage(raw_text=text)
+        msg.musteri_username = match.group(1)
+        msg.musteri_id = match.group(2)
+        msg.musteri_adi = f"{match.group(3)} {match.group(4)}"
+        msg.platform = self._extract_platform(text)
+        msg.islem_tipi, msg.confidence = self._detect_islem_tipi(text)
+
+        # KT talebi mi?
+        if msg.islem_tipi == IslemTipi.BILINMIYOR:
+            text_lower = text.lower()
+            if 'kt' in text_lower or 'dekont' in text_lower:
+                msg.islem_tipi = IslemTipi.KT
+                msg.confidence = 0.8
+
+        msg.keywords = self._extract_keywords(text)
+        msg.iban = self._extract_iban(text)
+        tutar_info = self._extract_tutar(text)
+        if tutar_info:
+            msg.tutar, msg.tutar_str, msg.para_birimi, msg.tutar_yonu = tutar_info
+
+        return msg
+
     def _extract_id(self, text: str) -> Optional[str]:
         match = self.ID_PATTERN.search(text)
         return match.group(1) if match else None
@@ -157,21 +313,29 @@ class MessageParser:
         return match.group(1) if match else None
 
     def _extract_name(self, text: str) -> Optional[str]:
-        # "mediha tekgöz @tekmediha99 ID: 2026..." formatından isim çıkar
+        lines = text.strip().split('\n')
+
+        # Format 1: İlk satır isim, ikinci satır @username
+        if len(lines) >= 2 and lines[1].strip().startswith('@'):
+            name = lines[0].strip()
+            if name and not name.startswith('ID:') and '₺' not in name:
+                return name
+
+        # Format 2: "isim @username" aynı satırda
         pattern = re.compile(r'([a-zA-ZçğıöşüÇĞIİÖŞÜ]+\s+[a-zA-ZçğıöşüÇĞIİÖŞÜ]+)\s*@')
         match = pattern.search(text)
         if match:
             return match.group(1).strip()
 
-        # "e96b047a  mediha tekgöz — — ₺22.000,00" formatı
-        pattern2 = re.compile(r'[a-f0-9]{6,}\s+([a-zA-ZçğıöşüÇĞIİÖŞÜ]+\s+[a-zA-ZçğıöşüÇĞIİÖŞÜ]+)\s*[—\-]')
-        match2 = pattern2.search(text)
-        if match2:
-            return match2.group(1).strip()
+        # Format 3: KT formatı "USERNAME ID AD SOYAD"
+        kt_match = self.KT_FORMAT_PATTERN.search(text)
+        if kt_match:
+            return f"{kt_match.group(3)} {kt_match.group(4)}"
 
         return None
 
     def _extract_tutar(self, text: str):
+        is_cekim = '-₺' in text or text.strip().startswith('-')
         for pattern in self.TUTAR_PATTERNS:
             match = pattern.search(text)
             if match:
@@ -184,16 +348,27 @@ class MessageParser:
                     para = "TL"
                     if len(match.groups()) > 1 and match.group(2):
                         para = match.group(2).upper()
-                    return tutar, tutar_str, para
+                    yonu = "cekim" if is_cekim else ""
+                    return tutar, tutar_str, para, yonu
                 except ValueError:
                     continue
         return None
 
+    def _extract_talep_tarihi(self, text: str) -> Optional[str]:
+        match = self.TALEP_PATTERN.search(text)
+        return match.group(1) if match else None
+
     def _extract_hash(self, text: str) -> Optional[str]:
-        # Satırın başındaki kısa hex hash (e96b047a gibi)
-        match = re.match(r'^([a-f0-9]{6,10})\s', text, re.IGNORECASE)
+        # SHA256 hash (64 karakter)
+        match = self.HASH_PATTERN.search(text)
         if match:
             return match.group(1)
+        # Kısa hash
+        match = self.SHORT_HASH_PATTERN.search(text)
+        if match and len(match.group(1)) >= 8:
+            # Hash'in mesajın ana içeriği olup olmadığını kontrol et
+            if text.strip() == match.group(1):
+                return match.group(1)
         return None
 
     def _extract_iban(self, text: str) -> Optional[str]:
