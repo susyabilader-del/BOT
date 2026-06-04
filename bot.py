@@ -31,7 +31,8 @@ class VerifierBot:
             "🔍 **Ödeme Doğrulama Botu**\n\n"
             "**🚨 Tespit:**\n"
             "/verify - Tam doğrulama (kritik çelişkiler)\n"
-            "/tutarsiz - Sadece çelişki/tutarsızlıklar\n\n"
+            "/tutarsiz - Sadece çelişki/tutarsızlıklar\n"
+            "/edit - Tutar edit işlemleri (büyük düşüş tespiti)\n\n"
             "**🔎 Sorgulama:**\n"
             "/cekim - Çekim işlemleri (iptal/bekleyen)\n"
             "/yatirim - Yatırım işlemleri\n"
@@ -563,6 +564,81 @@ class VerifierBot:
         except Exception as e:
             await msg.edit_text(f"❌ Hata: {e}")
 
+    async def cmd_edit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Tutar edit işlemlerini listele - büyük düşüşleri flag'le."""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        from parser import MessageParser, IslemTipi
+        from database import get_messages_by_group
+        from datetime import datetime, timedelta
+
+        msg = await update.message.reply_text("🔍 Edit işlemleri taranıyor...")
+
+        try:
+            parser = MessageParser()
+            since = (datetime.now() - timedelta(days=7)).isoformat()
+            all_msgs = await get_messages_by_group("source", since_date=since, limit=3000)
+            all_msgs += await get_messages_by_group("verify", since_date=since, limit=3000)
+
+            edits = []
+            for m in all_msgs:
+                p = parser.parse(m["text"])
+                if p.islem_tipi == IslemTipi.EDIT_ONAY:
+                    edits.append({
+                        "isim": p.musteri_adi or "?",
+                        "hash": p.islem_hash or "?",
+                        "banka": p.banka or "",
+                        "tutar": p.tutar,
+                        "onceki": p.tutar_edit_oncesi,
+                        "tarih": m["date"][:16],
+                        "platform": p.platform or "",
+                    })
+
+            if not edits:
+                await msg.edit_text("ℹ️ Son 7 günde edit işlemi bulunamadı.")
+                return
+
+            # Büyük düşüşleri önce göster (>%50 fark)
+            buyuk = []
+            normal = []
+            for e in edits:
+                if e["onceki"] and e["tutar"] and e["onceki"] > 0:
+                    oran = (1 - e["tutar"] / e["onceki"]) * 100
+                    e["dusus"] = oran
+                    if oran >= 50:
+                        buyuk.append(e)
+                    else:
+                        normal.append(e)
+                else:
+                    e["dusus"] = None
+                    normal.append(e)
+
+            text = f"✏️ **Edit İşlemleri** (son 7 gün)\n\n"
+
+            if buyuk:
+                text += f"🚨 **BÜYÜK DÜŞÜŞ ({len(buyuk)}):**\n"
+                for e in buyuk[:10]:
+                    text += (f"  🔴 `{e['hash']}` {e['isim']}\n"
+                            f"     ₺{e['onceki']:,.0f} → ₺{e['tutar']:,.0f} "
+                            f"(**%{e['dusus']:.0f} düşüş**)\n"
+                            f"     {e['banka']} | {e['tarih']}\n\n")
+
+            if normal:
+                text += f"📋 **Diğer Editler ({len(normal)}):**\n"
+                for e in normal[:5]:
+                    onceki_str = f"₺{e['onceki']:,.0f} → " if e['onceki'] else ""
+                    text += f"  • `{e['hash']}` {e['isim']} | {onceki_str}₺{e['tutar']:,.0f} | {e['tarih']}\n"
+                if len(normal) > 5:
+                    text += f"  ... ve {len(normal) - 5} daha\n"
+
+            text += f"\n📊 Toplam: {len(edits)} edit | {len(buyuk)} büyük düşüş"
+
+            await msg.edit_text(text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Edit komutu hatası: {e}", exc_info=True)
+            await msg.edit_text(f"❌ Hata: {e}")
+
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update.effective_user.id):
             return
@@ -571,20 +647,20 @@ class VerifierBot:
             "📖 **Ödeme Doğrulama Botu - Yardım**\n\n"
             "Bu bot, operasyon grubundaki mesajları tarayarak "
             "ödeme/API grubundaki mesajlarla çapraz doğrulama yapar.\n\n"
-            "**Temel Akış:**\n"
-            "1. `/scan` ile grupları tarayın\n"
-            "2. `/verify` ile doğrulamayı çalıştırın\n"
-            "3. `/report` ile sonuçları görün\n\n"
-            "**Otomatik Kontroller:**\n"
-            "• Çekim iptal edilmiş ama ödeme yapılmış\n"
-            "• Personel onay vermiş ama API red döndü\n"
-            "• Ödeme sağlanmış ama sistem red veriyor\n"
-            "• Tutar uyuşmazlığı\n"
-            "• İşlem eşleşme (ID, isim, tutar, hash)\n\n"
-            "**Sorgulama:**\n"
+            "**🚨 Tespit:**\n"
+            "`/verify` - Tam doğrulama (kritik çelişkiler)\n"
+            "`/tutarsiz` - Sadece tutarsızlıklar\n"
+            "`/edit` - Tutar edit işlemleri (büyük düşüş tespiti)\n\n"
+            "**🔎 Sorgulama:**\n"
+            "`/cekim` - Çekim işlemleri\n"
+            "`/yatirim` - Yatırım işlemleri\n"
             "`/musteri <isim/ID>` - Müşteri detayı\n"
-            "`/tutarsizlik` - Tüm tutarsızlıklar\n"
+            "`/tarih <GG.AA>` - Tarihe göre sorgula\n"
             "`/search <metin>` - Serbest arama\n\n"
+            "**📊 Genel:**\n"
+            "`/scan` - Grupları tara\n"
+            "`/report` - Rapor\n"
+            "`/api geciken` - API geciken işlemler\n\n"
             "**Durum Kodları:**\n"
             "✅ Doğrulanmış | ⚠️ Kısmi | 🔴 Tutarsız | ❌ Red | ⏳ Bekleyen"
         )
@@ -607,6 +683,7 @@ class VerifierBot:
         self.app.add_handler(CommandHandler("cekim", self.cmd_cekim))
         self.app.add_handler(CommandHandler("yatirim", self.cmd_yatirim))
         self.app.add_handler(CommandHandler("tarih", self.cmd_tarih))
+        self.app.add_handler(CommandHandler("edit", self.cmd_edit))
         self.app.add_handler(CommandHandler("status", self.cmd_status))
         self.app.add_handler(CommandHandler("help", self.cmd_help))
 

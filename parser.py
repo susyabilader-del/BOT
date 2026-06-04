@@ -20,6 +20,7 @@ class IslemTipi(Enum):
     UYGUNDUR = "uygundur"
     IPTAL = "iptal"
     GONDERIM = "gonderim"
+    EDIT_ONAY = "edit_onay"  # Tutar editlenerek onaylanmış
     BILINMIYOR = "bilinmiyor"
 
 
@@ -39,6 +40,8 @@ class ParsedMessage:
     durum: Optional[str] = None
     iban: Optional[str] = None
     talep_tarihi: Optional[str] = None
+    banka: Optional[str] = None
+    tutar_edit_oncesi: Optional[float] = None  # Edit öncesi tutar
     reply_to: Optional[str] = None
     keywords: List[str] = field(default_factory=list)
     confidence: float = 0.0
@@ -138,6 +141,11 @@ class MessageParser:
         """Mesaj metnini parse eder ve yapılandırılmış veri döner."""
         msg = ParsedMessage(raw_text=text)
 
+        # Edit onay formatı (hash isim — banka ₺tutar PLATFORM — Durum)
+        edit_msg = self._parse_edit_onay_format(text)
+        if edit_msg:
+            return edit_msg
+
         # Önce yapılandırılmış blok mu kontrol et
         structured = self._parse_structured_block(text)
         if structured:
@@ -177,6 +185,145 @@ class MessageParser:
         msg.reply_to = self._extract_reply(text)
 
         return msg
+
+    def _parse_edit_onay_format(self, text: str) -> Optional[ParsedMessage]:
+        """
+        Edit onay formatını parse eder.
+        Format:
+            1e56aaef Hüseyin Çakmak — ING Bank - DNA ₺5.000,00 ALLHAVALE — Onaylı
+            işlem 50.000₺ tutarından 5.000₺ tutarına editlenerek onaylanmıştır.
+        Alternatif:
+            SAHA 1 | #558200B9 id'li yatırım 5000₺ tutardan 4500₺ tutarına edit onaylanmıştır
+        """
+        lines = text.strip().split('\n')
+        full_text = text.strip().lower()
+
+        # "editlenerek onaylanmıştır" veya "edit onaylanmıştır" kontrolü
+        if 'edit' not in full_text or 'onay' not in full_text:
+            return None
+
+        msg = ParsedMessage(raw_text=text, is_structured=True, islem_tipi=IslemTipi.EDIT_ONAY, confidence=0.95)
+
+        # Format 1: "hash isim — banka - tip ₺tutar PLATFORM — Durum"
+        header_pattern = re.compile(
+            r'^([0-9a-fA-F]{6,10})\s+'  # short hash
+            r'(.+?)\s*[—\-]\s*'          # isim
+            r'(.+?)\s*[—\-]\s*'          # banka - tip
+            r'[₺]?([\d.,]+)\s*'          # tutar
+            r'(\w+)\s*[—\-]\s*'          # platform
+            r'(\S+)',                      # durum
+            re.UNICODE
+        )
+
+        # Format 2: "SAHA X | #hash id'li yatırım Xk₺ tutardan Y₺ tutarına edit"
+        saha_pattern = re.compile(
+            r'(?:SAHA|KILIC|GOLFO)\s*\d*\s*\|\s*#?([0-9a-fA-F]+)',
+            re.IGNORECASE
+        )
+
+        # İlk satırı header olarak dene
+        for line in lines:
+            line_clean = line.strip()
+
+            # Format 1 header
+            h_match = re.match(
+                r'^([0-9a-fA-F]{6,10})\s+(.+?)\s+[—–\-]+\s+(.+?)\s+[—–\-]+\s+(.+?)₺([\d.,]+)\s+(\w+)\s+[—–\-]+\s+(\S+)',
+                line_clean
+            )
+            if not h_match:
+                # Daha esnek: "hash isim — bank ₺amount PLATFORM — Status"
+                h_match = re.match(
+                    r'^([0-9a-fA-F]{6,10})\s+(.+?)\s*—\s*(.+?)\s+₺([\d.,]+)\s+(\w+)\s*—\s*(\S+)',
+                    line_clean
+                )
+                if h_match:
+                    msg.islem_hash = h_match.group(1)
+                    msg.musteri_adi = h_match.group(2).strip()
+                    msg.banka = h_match.group(3).strip().rstrip(' -')
+                    tutar_str = h_match.group(4)
+                    msg.tutar = self._parse_tutar_value(tutar_str)
+                    msg.tutar_str = f"₺{tutar_str}"
+                    msg.platform = h_match.group(5)
+                    msg.durum = h_match.group(6).lower()
+                    continue
+
+            if h_match and len(h_match.groups()) >= 7:
+                msg.islem_hash = h_match.group(1)
+                msg.musteri_adi = h_match.group(2).strip()
+                msg.banka = h_match.group(3).strip()
+                tutar_str = h_match.group(5)
+                msg.tutar = self._parse_tutar_value(tutar_str)
+                msg.tutar_str = f"₺{tutar_str}"
+                msg.platform = h_match.group(6)
+                msg.durum = h_match.group(7).lower()
+                continue
+
+            # SAHA format
+            s_match = saha_pattern.match(line_clean)
+            if s_match:
+                msg.islem_hash = s_match.group(1)
+
+        # Edit tutarlarını çıkar: "X₺ tutarından/tutardan Y₺ tutarına"
+        edit_pattern = re.compile(
+            r'(\d[\d.,]*)\s*k?\s*₺?\s*tutar[ıi]?n?(?:d[ae]n|dan)?\s+'
+            r'(\d[\d.,]*)\s*k?\s*₺?\s*tutar[ıi]na',
+            re.IGNORECASE
+        )
+        edit_match = edit_pattern.search(text)
+        if edit_match:
+            onceki_str = edit_match.group(1)
+            sonraki_str = edit_match.group(2)
+
+            # "k" suffix (100k = 100.000)
+            onceki_raw = text[edit_match.start(1):edit_match.end(1) + 5]
+            sonraki_raw = text[edit_match.start(2):edit_match.end(2) + 5]
+
+            msg.tutar_edit_oncesi = self._parse_tutar_value(onceki_str)
+            if 'k' in onceki_raw.lower():
+                msg.tutar_edit_oncesi = (msg.tutar_edit_oncesi or 0) * 1000
+
+            edit_sonrasi = self._parse_tutar_value(sonraki_str)
+            if 'k' in sonraki_raw.lower():
+                edit_sonrasi = (edit_sonrasi or 0) * 1000
+
+            # Güncel tutar = edit sonrası
+            if edit_sonrasi:
+                msg.tutar = edit_sonrasi
+        elif not msg.tutar:
+            # Sadece "Y₺ tutarına editlenerek" formatı
+            single_edit = re.search(r'(\d[\d.,]*)\s*k?\s*₺\s*tutar[ıi]na', text)
+            if single_edit:
+                msg.tutar = self._parse_tutar_value(single_edit.group(1))
+
+        # Hash bulunamadıysa metin içinden dene
+        if not msg.islem_hash:
+            hash_match = re.search(r'#?([0-9a-fA-F]{8})', text)
+            if hash_match:
+                msg.islem_hash = hash_match.group(1)
+
+        msg.tutar_yonu = "yatirim"
+        msg.keywords = ["edit", "onay"]
+
+        return msg
+
+    def _parse_tutar_value(self, tutar_str: str) -> Optional[float]:
+        """Tutar string'ini float'a çevirir: '5.000,00' -> 5000.0, '50.000' -> 50000.0"""
+        if not tutar_str:
+            return None
+        try:
+            cleaned = tutar_str.replace(' ', '')
+            if ',' in cleaned:
+                # Türk formatı: 5.000,00
+                cleaned = cleaned.replace('.', '').replace(',', '.')
+            else:
+                # 5.000 formatı (binlik ayracı)
+                if cleaned.count('.') == 1 and len(cleaned.split('.')[-1]) == 3:
+                    cleaned = cleaned.replace('.', '')
+                elif cleaned.count('.') > 1:
+                    cleaned = cleaned.replace('.', '')
+            return float(cleaned)
+        except (ValueError, TypeError):
+            return None
 
     def _parse_structured_block(self, text: str) -> Optional[ParsedMessage]:
         """
