@@ -28,13 +28,15 @@ class VerifierBot:
             return
 
         await update.message.reply_text(
-            "🔍 **Ödeme Doğrulama Botu**\n\n"
-            "**🚨 Tespit:**\n"
-            "/verify - Tam doğrulama (kritik çelişkiler)\n"
-            "/tutarsiz - Sadece çelişki/tutarsızlıklar\n"
-            "/edit - Tutar edit işlemleri (büyük düşüş tespiti)\n\n"
+            "🔍 **İşlem Eşleştirme Botu**\n\n"
+            "Telegram gruplarından transaction ID çıkarır, "
+            "API ile eşleştirip tutarsızlıkları raporlar.\n\n"
+            "**⚡ Ana Komutlar:**\n"
+            "/esle - Grup → API eşleştirme çalıştır\n"
+            "/fark - Sadece farkları göster\n"
+            "/edit - Tutar edit işlemleri\n\n"
             "**🔎 Sorgulama:**\n"
-            "/cekim - Çekim işlemleri (iptal/bekleyen)\n"
+            "/cekim - Çekim işlemleri\n"
             "/yatirim - Yatırım işlemleri\n"
             "/musteri <isim/ID> - Müşteri detay\n"
             "/tarih <GG.AA> - Tarihe göre sorgula\n"
@@ -42,7 +44,6 @@ class VerifierBot:
             "**📊 Genel:**\n"
             "/scan - Grupları tara\n"
             "/report - Rapor göster\n"
-            "/api geciken - API geciken işlemler\n"
             "/status - Bot durumu",
             parse_mode="Markdown"
         )
@@ -61,6 +62,144 @@ class VerifierBot:
             await msg.edit_text(text, parse_mode="Markdown")
         except Exception as e:
             await msg.edit_text(f"❌ Tarama hatası: {e}")
+
+    async def cmd_esle(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ana eşleştirme komutu: Grup → API karşılaştırma."""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        from matcher import TransactionMatcher, EslesmeDurumu
+        from database import get_messages_by_group
+        from datetime import datetime, timedelta
+
+        msg = await update.message.reply_text("🔄 İşlem eşleştirme başlatılıyor...")
+
+        try:
+            matcher = TransactionMatcher()
+            since = (datetime.now() - timedelta(days=7)).isoformat()
+
+            # Grup mesajlarından transaction ID çıkar
+            source_msgs = await get_messages_by_group("source", since_date=since, limit=3000)
+            verify_msgs = await get_messages_by_group("verify", since_date=since, limit=3000)
+
+            grup_islemleri = matcher.extract_from_messages(source_msgs, kaynak="cekim")
+            grup_islemleri += matcher.extract_from_messages(verify_msgs, kaynak="yatirim")
+
+            if not grup_islemleri:
+                await msg.edit_text("ℹ️ Gruplarda transaction ID bulunamadı.\nÖnce /scan yapın.")
+                return
+
+            # API'den işlemleri çek
+            try:
+                api_islemleri = await matcher.fetch_api_transactions(days_back=7)
+                api_ok = True
+            except Exception as api_err:
+                api_islemleri = []
+                api_ok = False
+                logger.warning(f"API erişim hatası: {api_err}")
+
+            if api_ok and api_islemleri:
+                # Tam eşleştirme yap
+                raporlar = matcher.match(grup_islemleri, api_islemleri)
+                text = matcher.format_telegram_report(raporlar)
+            else:
+                # API erişimi yok - sadece grup verilerini göster
+                text = "📋 **Grup İşlem Özeti** (API erişimi yok)\n\n"
+                text += f"🔢 Toplam: {len(grup_islemleri)} transaction ID tespit edildi\n\n"
+
+                # Tip bazlı dökümü
+                from parser import IslemTipi
+                tip_sayac = {}
+                for g in grup_islemleri:
+                    tip = g.islem_tipi.value
+                    tip_sayac[tip] = tip_sayac.get(tip, 0) + 1
+
+                text += "**Tip Dağılımı:**\n"
+                for tip, sayi in sorted(tip_sayac.items(), key=lambda x: -x[1]):
+                    text += f"  • {tip}: {sayi}\n"
+
+                # Son 5 işlemi göster
+                text += f"\n**Son İşlemler:**\n"
+                for g in grup_islemleri[-5:]:
+                    durum_icon = "✅" if g.durum and "onay" in g.durum else "⏳"
+                    tutar_str = f"₺{g.tutar:,.0f}" if g.tutar else "?"
+                    text += f"  {durum_icon} `{g.transaction_id}` {g.musteri_adi or '?'} | {tutar_str}\n"
+
+                if not api_ok:
+                    text += "\n⚠️ API IP whitelist hatası. IP eklendikten sonra /esle tam çalışacak."
+
+            await msg.edit_text(text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Eşleştirme hatası: {e}", exc_info=True)
+            await msg.edit_text(f"❌ Hata: {e}")
+
+    async def cmd_fark(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Sadece farkları/tutarsızlıkları göster."""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        from matcher import TransactionMatcher, EslesmeDurumu
+        from database import get_messages_by_group
+        from datetime import datetime, timedelta
+
+        msg = await update.message.reply_text("🔍 Farklar taranıyor...")
+
+        try:
+            matcher = TransactionMatcher()
+            since = (datetime.now() - timedelta(days=7)).isoformat()
+
+            source_msgs = await get_messages_by_group("source", since_date=since, limit=3000)
+            verify_msgs = await get_messages_by_group("verify", since_date=since, limit=3000)
+
+            grup_islemleri = matcher.extract_from_messages(source_msgs, kaynak="cekim")
+            grup_islemleri += matcher.extract_from_messages(verify_msgs, kaynak="yatirim")
+
+            if not grup_islemleri:
+                await msg.edit_text("ℹ️ Gruplarda transaction ID bulunamadı.")
+                return
+
+            try:
+                api_islemleri = await matcher.fetch_api_transactions(days_back=7)
+            except Exception:
+                await msg.edit_text("⚠️ API erişim hatası (IP whitelist). Fark raporu API gerektirir.")
+                return
+
+            raporlar = matcher.match(grup_islemleri, api_islemleri)
+
+            # Sadece farkları filtrele
+            farklar = [r for r in raporlar if r.durum != EslesmeDurumu.ESLESTI]
+
+            if not farklar:
+                await msg.edit_text("✅ Hiç fark yok — tüm işlemler tutarlı!")
+                return
+
+            text = f"🔴 **Fark Raporu** ({len(farklar)} tutarsızlık)\n\n"
+
+            for r in farklar[:15]:
+                if r.durum == EslesmeDurumu.TUTAR_FARKI:
+                    icon = "💰"
+                elif r.durum == EslesmeDurumu.STATUS_FARKI:
+                    icon = "⚡"
+                elif r.durum == EslesmeDurumu.EDIT_YAPILMIS:
+                    icon = "✏️"
+                elif r.durum == EslesmeDurumu.API_BULUNAMADI:
+                    icon = "❓"
+                else:
+                    icon = "👻"
+
+                isim = r.grup_verisi.musteri_adi if r.grup_verisi else (
+                    r.api_verisi.player_name if r.api_verisi else "?"
+                )
+                text += f"{icon} `{r.transaction_id}` {isim}\n"
+                text += f"   {r.aciklama}\n\n"
+
+            if len(farklar) > 15:
+                text += f"... ve {len(farklar) - 15} daha"
+
+            await msg.edit_text(text, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Fark raporu hatası: {e}", exc_info=True)
+            await msg.edit_text(f"❌ Hata: {e}")
 
     async def cmd_verify(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_admin(update.effective_user.id):
@@ -671,6 +810,8 @@ class VerifierBot:
 
         self.app.add_handler(CommandHandler("start", self.cmd_start))
         self.app.add_handler(CommandHandler("scan", self.cmd_scan))
+        self.app.add_handler(CommandHandler("esle", self.cmd_esle))
+        self.app.add_handler(CommandHandler("fark", self.cmd_fark))
         self.app.add_handler(CommandHandler("verify", self.cmd_verify))
         self.app.add_handler(CommandHandler("report", self.cmd_report))
         self.app.add_handler(CommandHandler("rules", self.cmd_rules))
